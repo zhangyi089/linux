@@ -4615,27 +4615,16 @@ retry:
 			ext4_journal_stop(handle);
 			break;
 		}
+
+		ret2 = ext4_journal_stop(handle);
+		if (unlikely(ret2)) {
+			ret = ret2;
+			break;
+		}
 		/*
 		 * allow a full retry cycle for any remaining allocations
 		 */
 		retries = 0;
-		epos = EXT4_LBLK_TO_B(inode, map.m_lblk + ret);
-		inode_set_ctime_current(inode);
-		if (new_size) {
-			if (epos > new_size)
-				epos = new_size;
-			if (ext4_update_inode_size(inode, epos) & 0x1)
-				inode_set_mtime_to_ts(inode,
-						      inode_get_ctime(inode));
-			if (epos > old_size)
-				pagecache_isize_extended(inode, old_size, epos);
-		}
-		ret2 = ext4_mark_inode_dirty(handle, inode);
-		ext4_update_inode_fsync_trans(handle, inode, 1);
-		ret3 = ext4_journal_stop(handle);
-		ret2 = ret3 ? ret3 : ret2;
-		if (unlikely(ret2))
-			break;
 
 		if (alloc_zero &&
 		    (map.m_flags & (EXT4_MAP_MAPPED | EXT4_MAP_UNWRITTEN))) {
@@ -4645,8 +4634,10 @@ retry:
 				ret2 = ext4_convert_unwritten_extents(NULL,
 					inode, (loff_t)map.m_lblk << blkbits,
 					(loff_t)map.m_len << blkbits);
-			if (ret2)
+			if (ret2) {
+				ret = ret2;
 				break;
+			}
 		}
 
 		map.m_lblk += ret;
@@ -4654,6 +4645,27 @@ retry:
 	}
 	if (ret == -ENOSPC && ext4_should_retry_alloc(inode->i_sb, &retries))
 		goto retry;
+
+	if (!new_size)
+		return ret;
+
+	epos = EXT4_LBLK_TO_B(inode, map.m_lblk);
+	if (epos > new_size)
+		epos = new_size;
+
+	if (epos > old_size) {
+		handle = ext4_journal_start(inode, EXT4_HT_MISC, 1);
+		if (IS_ERR(handle))
+			return PTR_ERR(handle);
+
+		ext4_update_inode_size(inode, epos);
+		pagecache_isize_extended(inode, old_size, epos);
+
+		ret2 = ext4_mark_inode_dirty(handle, inode);
+		ext4_update_inode_fsync_trans(handle, inode, 1);
+		ret3 = ext4_journal_stop(handle);
+		ret = ret3 ? ret3 : ret2;
+	}
 
 	return ret > 0 ? ret2 : ret;
 }
