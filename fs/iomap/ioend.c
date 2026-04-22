@@ -305,7 +305,7 @@ new_ioend:
 }
 EXPORT_SYMBOL_GPL(iomap_add_to_ioend);
 
-static u32 iomap_finish_ioend(struct iomap_ioend *ioend, int error)
+u32 iomap_finish_ioend(struct iomap_ioend *ioend, int error)
 {
 	if (ioend->io_parent) {
 		struct bio *bio = &ioend->io_bio;
@@ -333,6 +333,7 @@ static u32 iomap_finish_ioend(struct iomap_ioend *ioend, int error)
 		return iomap_finish_ioend_buffered_read(ioend);
 	return iomap_finish_ioend_buffered_write(ioend);
 }
+EXPORT_SYMBOL_GPL(iomap_finish_ioend);
 
 /*
  * Ioend completion routine for merged bios. This can only be called from task
