@@ -4868,9 +4868,6 @@ int ext4_block_zero_eof(struct inode *inode, loff_t from, loff_t end)
 	 * truncating up or performing an append write, because there might be
 	 * exposing stale on-disk data which may caused by concurrent post-EOF
 	 * mmap write during folio writeback.
-	 *
-	 * TODO: In the iomap path, handle this by updating i_disksize to
-	 * i_size after the zeroed data has been written back.
 	 */
 	if (did_zero && zero_written && !IS_DAX(inode)) {
 		if (ext4_should_order_data(inode)) {
@@ -4894,9 +4891,15 @@ int ext4_block_zero_eof(struct inode *inode, loff_t from, loff_t end)
 		 * for I/O completion before updating i_disksize if the write
 		 * extends beyond the zeroed boundary.
 		 *
-		 * TODO: Any other operation that extends i_disksize
-		 * (including truncate up and append fallocate) must wait for
-		 * the relevant I/O to complete before updating i_disksize.
+		 * When zeroed I/O is in progress, operations that extend
+		 * i_disksize are handled as follows:
+		 *
+		 *  - Truncate up, append fallocate and zero_range:
+		 *    Defer the update. The file size will be updated to
+		 *    i_size by the end_io handler once the ongoing I/O
+		 *    completes.
+		 *
+		 *  - TODO: handle insert range and collapse range.
 		 */
 		} else if (ext4_inode_buffered_iomap(inode)) {
 			err = ext4_iomap_submit_zero_block(inode, from, end);
@@ -6512,11 +6515,16 @@ static void ext4_wait_for_tail_page_commit(struct inode *inode)
 }
 
 /*
- * Set i_size and i_disksize to 'newsize'.
+ * Set i_size and i_disksize to 'newsize'.  In the iomap buffered I/O path,
+ * if i_ordered_len is non-zero and newsize exceeds the current i_disksize,
+ * the actual i_disksize update is deferred until after the ordered data is
+ * written out.  In that case, i_disksize will be set to i_size upon I/O
+ * completion.
  *
  * Both i_rwsem and i_data_sem are required here to avoid races between
- * generic append writeback and concurrent truncate that also modify
- * i_size and i_disksize.
+ * generic append writeback (or ordered I/O writeback) and concurrent
+ * operations (e.g., fallocate, truncate) that also modify i_size and
+ * i_disksize.
  */
 static inline void ext4_set_inode_size(struct inode *inode, loff_t newsize)
 {
@@ -6524,7 +6532,9 @@ static inline void ext4_set_inode_size(struct inode *inode, loff_t newsize)
 
 	down_write(&EXT4_I(inode)->i_data_sem);
 	i_size_write(inode, newsize);
-	EXT4_I(inode)->i_disksize = newsize;
+	if (READ_ONCE(EXT4_I(inode)->i_ordered_len) == 0 ||
+	    newsize < EXT4_I(inode)->i_disksize)
+		WRITE_ONCE(EXT4_I(inode)->i_disksize, newsize);
 	up_write(&EXT4_I(inode)->i_data_sem);
 }
 

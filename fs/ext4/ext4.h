@@ -3493,13 +3493,21 @@ do {								\
 #define EXT4_FREECLUSTERS_WATERMARK 0
 #endif
 
-/* Update i_disksize. Requires i_rwsem to avoid races with truncate */
+/*
+ * Update i_disksize. Requires i_rwsem to avoid races with truncate.
+ *
+ * In the iomap buffered I/O path, a non-zero i_ordered_len indicates that
+ * an ordered I/O (zeroing the EOF partial block) is still in progress.
+ * In that case, i_disksize will be updated after the ordered data has
+ * been written out.
+ */
 static inline void ext4_update_i_disksize(struct inode *inode, loff_t newsize)
 {
 	WARN_ON_ONCE(S_ISREG(inode->i_mode) &&
 		     !inode_is_locked(inode));
 	down_write(&EXT4_I(inode)->i_data_sem);
-	if (newsize > EXT4_I(inode)->i_disksize)
+	if (newsize > EXT4_I(inode)->i_disksize &&
+	    READ_ONCE(EXT4_I(inode)->i_ordered_len) == 0)
 		WRITE_ONCE(EXT4_I(inode)->i_disksize, newsize);
 	up_write(&EXT4_I(inode)->i_data_sem);
 }
@@ -3514,8 +3522,21 @@ static inline int ext4_update_inode_size(struct inode *inode, loff_t newsize)
 		changed = 1;
 	}
 	if (newsize > EXT4_I(inode)->i_disksize) {
-		ext4_update_i_disksize(inode, newsize);
-		changed |= 2;
+		/*
+		 * Pairs with smp_store_release() in ext4_iomap_end_bio()
+		 * that clears i_ordered_len.  The smp_mb() ensures the
+		 * i_size store above is globally visible before we read
+		 * i_ordered_len.  This way, if we skip the i_disksize
+		 * update because i_ordered_len is still non-zero, the
+		 * ordered-I/O completion path (which reads i_size under
+		 * i_data_sem) is guaranteed to see the new i_size and will
+		 * update i_disksize correctly.
+		 */
+		smp_mb();
+		if (READ_ONCE(EXT4_I(inode)->i_ordered_len) == 0) {
+			ext4_update_i_disksize(inode, newsize);
+			changed |= 2;
+		}
 	}
 	return changed;
 }
