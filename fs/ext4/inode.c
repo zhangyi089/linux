@@ -4742,6 +4742,32 @@ static int ext4_block_zero_range(struct inode *inode,
 					zero_written);
 }
 
+static int ext4_iomap_submit_zero_block(struct inode *inode,
+					loff_t from, loff_t end)
+{
+	struct address_space *mapping = inode->i_mapping;
+	struct folio *folio;
+	bool do_submit = false;
+
+	folio = filemap_lock_folio(mapping, from >> PAGE_SHIFT);
+	if (IS_ERR(folio))
+		/* Already writeback and clear? */
+		return PTR_ERR(folio) == -ENOENT ? 0 : PTR_ERR(folio);
+
+	folio_wait_writeback(folio);
+	WARN_ON_ONCE(folio_test_writeback(folio));
+
+	if (likely(folio_test_dirty(folio)))
+		do_submit = true;
+	folio_unlock(folio);
+	folio_put(folio);
+
+	/* Submit zeroed block. */
+	if (do_submit)
+		return filemap_fdatawrite_range(mapping, from, end - 1);
+	return 0;
+}
+
 /*
  * Zero out a mapping from file offset 'from' up to the end of the block
  * which corresponds to 'from' or to the given 'end' inside this block.
@@ -4765,8 +4791,10 @@ int ext4_block_zero_eof(struct inode *inode, loff_t from, loff_t end)
 	if (IS_ENCRYPTED(inode) && !fscrypt_has_encryption_key(inode))
 		return 0;
 
-	if (length > blocksize - offset)
+	if (length > blocksize - offset) {
 		length = blocksize - offset;
+		end = from + length;
+	}
 
 	err = ext4_block_zero_range(inode, from, length,
 				    &did_zero, &zero_written);
@@ -4781,18 +4809,34 @@ int ext4_block_zero_eof(struct inode *inode, loff_t from, loff_t end)
 	 * TODO: In the iomap path, handle this by updating i_disksize to
 	 * i_size after the zeroed data has been written back.
 	 */
-	if (ext4_should_order_data(inode) &&
-	    did_zero && zero_written && !IS_DAX(inode)) {
-		handle_t *handle;
+	if (did_zero && zero_written && !IS_DAX(inode)) {
+		if (ext4_should_order_data(inode)) {
+			handle_t *handle;
 
-		handle = ext4_journal_start(inode, EXT4_HT_MISC, 1);
-		if (IS_ERR(handle))
-			return PTR_ERR(handle);
+			handle = ext4_journal_start(inode, EXT4_HT_MISC, 1);
+			if (IS_ERR(handle))
+				return PTR_ERR(handle);
 
-		err = ext4_jbd2_inode_add_write(handle, inode, from, length);
-		ext4_journal_stop(handle);
-		if (err)
-			return err;
+			err = ext4_jbd2_inode_add_write(handle, inode, from,
+							length);
+			ext4_journal_stop(handle);
+			if (err)
+				return err;
+		/*
+		 * inodes using the iomap buffered I/O path do not use the
+		 * data=ordered mode. We submit zeroed range directly here.
+		 * Do not wait for I/O completion for performance.
+		 *
+		 * TODO: Any operation that extends i_disksize (including
+		 * append write end io past the zeroed boundary, truncate up,
+		 * and append fallocate) must wait for the relevant I/O to
+		 * complete before updating i_disksize.
+		 */
+		} else if (ext4_inode_buffered_iomap(inode)) {
+			err = ext4_iomap_submit_zero_block(inode, from, end);
+			if (err)
+				return err;
+		}
 	}
 
 	return 0;
