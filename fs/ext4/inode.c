@@ -5989,7 +5989,7 @@ int ext4_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
-	int error, rc = 0;
+	int error;
 	int orphan = 0;
 	const unsigned int ia_valid = attr->ia_valid;
 	bool inc_ivers = true;
@@ -6102,10 +6102,10 @@ int ext4_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 		filemap_invalidate_lock(inode->i_mapping);
 
-		rc = ext4_break_layouts(inode);
-		if (rc) {
+		error = ext4_break_layouts(inode);
+		if (error) {
 			filemap_invalidate_unlock(inode->i_mapping);
-			goto err_out;
+			return error;
 		}
 
 		if (attr->ia_size > oldsize)
@@ -6117,15 +6117,19 @@ int ext4_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		}
 
 		filemap_invalidate_unlock(inode->i_mapping);
+		if (error)
+			goto err_out;
 	}
 
-	if (!error) {
-		if (inc_ivers)
-			inode_inc_iversion(inode);
-		setattr_copy(idmap, inode, attr);
-		mark_inode_dirty(inode);
-	}
+	if (inc_ivers)
+		inode_inc_iversion(inode);
+	setattr_copy(idmap, inode, attr);
+	mark_inode_dirty(inode);
 
+	if (ia_valid & ATTR_MODE)
+		error = posix_acl_chmod(idmap, dentry, inode->i_mode);
+
+err_out:
 	/*
 	 * If the call to ext4_truncate failed to get a transaction handle at
 	 * all, we need to clean up the in-core orphan list manually.
@@ -6133,14 +6137,8 @@ int ext4_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (orphan && inode->i_nlink)
 		ext4_orphan_del(NULL, inode);
 
-	if (!error && (ia_valid & ATTR_MODE))
-		rc = posix_acl_chmod(idmap, dentry, inode->i_mode);
-
-err_out:
-	if  (error)
+	if (error)
 		ext4_std_error(inode->i_sb, error);
-	if (!error)
-		error = rc;
 	return error;
 }
 
