@@ -4345,6 +4345,7 @@ static int ext4_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 {
 	struct iomap_ioend *ioend = wpc->wb_ctx;
 	struct ext4_inode_info *ei = EXT4_I(ioend->io_inode);
+	ext4_lblk_t start, end, order_lblk, order_len;
 
 	/*
 	 * After I/O completion, a worker needs to be scheduled when:
@@ -4356,6 +4357,30 @@ static int ext4_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 	    (ioend->io_offset + ioend->io_size > READ_ONCE(ei->i_disksize)) ||
 	    test_opt(ioend->io_inode->i_sb, DATA_ERR_ABORT))
 		ioend->io_bio.bi_end_io = ext4_iomap_end_bio;
+
+	/*
+	 * Mark the I/O as ordered. Ordered I/O requires separate endio
+	 * handling and must not be merged with regular I/O operations.
+	 */
+	order_len = READ_ONCE(ei->i_ordered_len);
+	if (order_len) {
+		/*
+		 * Pair with smp_store_release() in ext4_block_zero_eof().
+		 * Ensure we see the updated i_ordered_lblk that was written
+		 * before the release store to i_ordered_len.
+		 */
+		smp_rmb();
+		order_lblk = READ_ONCE(ei->i_ordered_lblk);
+		start = ioend->io_offset >> ioend->io_inode->i_blkbits;
+		end = EXT4_B_TO_LBLK(ioend->io_inode,
+				     ioend->io_offset + ioend->io_size);
+
+		if (start <= order_lblk && end >= order_lblk + order_len) {
+			ioend->io_bio.bi_end_io = ext4_iomap_end_bio;
+			ioend->io_private = (void *)EXT4_IOMAP_IOEND_ORDER_IO;
+			ioend->io_flags |= IOMAP_IOEND_BOUNDARY;
+		}
+	}
 
 	return iomap_ioend_writeback_submit(wpc, error);
 }
@@ -4746,8 +4771,10 @@ static int ext4_iomap_submit_zero_block(struct inode *inode,
 					loff_t from, loff_t end)
 {
 	struct address_space *mapping = inode->i_mapping;
+	struct ext4_inode_info *ei = EXT4_I(inode);
 	struct folio *folio;
 	bool do_submit = false;
+	int ret;
 
 	folio = filemap_lock_folio(mapping, from >> PAGE_SHIFT);
 	if (IS_ERR(folio))
@@ -4757,14 +4784,50 @@ static int ext4_iomap_submit_zero_block(struct inode *inode,
 	folio_wait_writeback(folio);
 	WARN_ON_ONCE(folio_test_writeback(folio));
 
-	if (likely(folio_test_dirty(folio)))
+	/*
+	 * Mark the ordered range. It will be cleared upon I/O completion
+	 * in ext4_iomap_end_bio(). Any operation that extends i_disksize
+	 * (including append write end io past the zeroed boundary,
+	 * truncate up and append fallocate) must wait for this I/O to
+	 * complete before updating i_disksize.
+	 *
+	 * When multiple overlapping unaligned EOF writes are in flight, we
+	 * only need to track and wait for the first one. Subsequent writes
+	 * will zero the gap in memory and ensure that the zeroed data is
+	 * written out along with the valid data in the same block before
+	 * i_disksize is updated.
+	 */
+	if (likely(folio_test_dirty(folio) &&
+		   READ_ONCE(ei->i_ordered_len) == 0)) {
+		WRITE_ONCE(ei->i_ordered_lblk,
+			   from >> inode->i_blkbits);
+		/*
+		 * Pairs with smp_rmb() in ext4_iomap_writeback_submit()
+		 * and ext4_iomap_wb_ordered_wait(). Ensure the updated
+		 * i_ordered_lblk is visible when i_ordered_len becomes
+		 * non-zero.
+		 */
+		smp_store_release(&ei->i_ordered_len, 1);
 		do_submit = true;
+	}
 	folio_unlock(folio);
 	folio_put(folio);
 
 	/* Submit zeroed block. */
-	if (do_submit)
-		return filemap_fdatawrite_range(mapping, from, end - 1);
+	if (do_submit) {
+		ret = filemap_fdatawrite_range(mapping, from, end - 1);
+		if (ret) {
+			/*
+			 * Pairs with wait_event() in
+			 * ext4_iomap_wb_ordered_wait(). Ensure
+			 * i_ordered_len = 0 is visible before waking up
+			 * waiters.
+			 */
+			smp_store_release(&ei->i_ordered_len, 0);
+			wake_up_all(&ei->i_ordered_wq);
+			return ret;
+		}
+	}
 	return 0;
 }
 
@@ -4827,10 +4890,13 @@ int ext4_block_zero_eof(struct inode *inode, loff_t from, loff_t end)
 		 * data=ordered mode. We submit zeroed range directly here.
 		 * Do not wait for I/O completion for performance.
 		 *
-		 * TODO: Any operation that extends i_disksize (including
-		 * append write end io past the zeroed boundary, truncate up,
-		 * and append fallocate) must wait for the relevant I/O to
-		 * complete before updating i_disksize.
+		 * The end_io handler ext4_iomap_wb_ordered_wait() will wait
+		 * for I/O completion before updating i_disksize if the write
+		 * extends beyond the zeroed boundary.
+		 *
+		 * TODO: Any other operation that extends i_disksize
+		 * (including truncate up and append fallocate) must wait for
+		 * the relevant I/O to complete before updating i_disksize.
 		 */
 		} else if (ext4_inode_buffered_iomap(inode)) {
 			err = ext4_iomap_submit_zero_block(inode, from, end);
