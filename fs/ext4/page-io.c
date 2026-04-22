@@ -31,6 +31,8 @@
 #include "xattr.h"
 #include "acl.h"
 
+#include <trace/events/ext4.h>
+
 static struct kmem_cache *io_end_cachep;
 static struct kmem_cache *io_end_vec_cachep;
 
@@ -682,6 +684,9 @@ static int ext4_iomap_wb_update_disksize(handle_t *handle, struct inode *inode,
 	 * not yet on disk, but stale data will never be exposed.
 	 */
 	new_disksize = is_ordered ? i_size : min(end, i_size);
+	trace_ext4_iomap_disksize_update(inode, end, i_size, ei->i_disksize,
+					 new_disksize, is_ordered);
+
 	if (new_disksize > ei->i_disksize)
 		ei->i_disksize = new_disksize;
 	up_write(&ei->i_data_sem);
@@ -784,6 +789,10 @@ void ext4_iomap_end_bio(struct bio *bio)
 	 * the inode i_disksize.
 	 */
 	if (io_mode == EXT4_IOMAP_IOEND_ORDER_IO) {
+		trace_ext4_iomap_ordered_complete(inode, ioend->io_offset,
+				ioend->io_size, READ_ONCE(ei->i_ordered_lblk),
+				READ_ONCE(ei->i_ordered_len));
+
 		/*
 		 * Pairs with wait_event() in ext4_iomap_wb_ordered_wait().
 		 * Ensure i_ordered_len = 0 is visible before waking up
