@@ -5565,6 +5565,14 @@ static int ext4_collapse_range(struct file *file, loff_t offset, loff_t len)
 	if (ret)
 		return ret;
 
+	/*
+	 * Wait for ordered I/O to be complete. Updating i_disksize beyond
+	 * the current i_disksize here risks exposuring stale data.
+	 */
+	if (ext4_inode_buffered_iomap(inode))
+		wait_event(EXT4_I(inode)->i_ordered_wq,
+			   READ_ONCE(EXT4_I(inode)->i_ordered_len) == 0);
+
 	truncate_pagecache(inode, start);
 
 	credits = ext4_chunk_trans_extent(inode, 0);
@@ -5597,6 +5605,7 @@ static int ext4_collapse_range(struct file *file, loff_t offset, loff_t len)
 		goto out_handle;
 	}
 
+	WARN_ON_ONCE(READ_ONCE(EXT4_I(inode)->i_ordered_len) != 0);
 	new_size = inode->i_size - len;
 	i_size_write(inode, new_size);
 	EXT4_I(inode)->i_disksize = new_size;
@@ -5661,6 +5670,14 @@ static int ext4_insert_range(struct file *file, loff_t offset, loff_t len)
 	if (ret)
 		return ret;
 
+	/*
+	 * Wait for ordered I/O to be complete. Updating i_disksize beyond
+	 * the current i_disksize here risks exposuring stale data.
+	 */
+	if (ext4_inode_buffered_iomap(inode))
+		wait_event(EXT4_I(inode)->i_ordered_wq,
+			   READ_ONCE(EXT4_I(inode)->i_ordered_len) == 0);
+
 	truncate_pagecache(inode, start);
 
 	credits = ext4_chunk_trans_extent(inode, 0);
@@ -5671,6 +5688,7 @@ static int ext4_insert_range(struct file *file, loff_t offset, loff_t len)
 	ext4_fc_mark_ineligible(sb, EXT4_FC_REASON_FALLOC_RANGE, handle);
 
 	/* Expand file to avoid data loss if there is error while shifting */
+	WARN_ON_ONCE(READ_ONCE(EXT4_I(inode)->i_ordered_len) != 0);
 	inode->i_size += len;
 	EXT4_I(inode)->i_disksize += len;
 	ret = ext4_mark_inode_dirty(handle, inode);

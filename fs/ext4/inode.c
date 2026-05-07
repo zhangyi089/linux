@@ -4899,7 +4899,9 @@ int ext4_block_zero_eof(struct inode *inode, loff_t from, loff_t end)
 		 *    i_size by the end_io handler once the ongoing I/O
 		 *    completes.
 		 *
-		 *  - TODO: handle insert range and collapse range.
+		 *  - Insert range and collapse range operations:
+		 *    Wait synchronously for the relevant I/O to complete
+		 *    before updating i_disksize.
 		 */
 		} else if (ext4_inode_buffered_iomap(inode)) {
 			err = ext4_iomap_submit_zero_block(inode, from, end);
