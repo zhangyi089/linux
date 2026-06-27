@@ -703,6 +703,7 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
 	struct extent_status es;
 	int retval;
 	int ret = 0;
+	bool internal_handle = false;
 	unsigned int orig_mlen;
 #ifdef ES_AGGRESSIVE_TEST
 	struct ext4_map_blocks orig_map;
@@ -790,8 +791,10 @@ create_retry:
 found:
 	if (retval > 0 && map->m_flags & EXT4_MAP_MAPPED) {
 		ret = check_block_validity(inode, map);
-		if (ret != 0)
-			return ret;
+		if (ret != 0) {
+			retval = ret;
+			goto out_handle;
+		}
 	}
 
 	/* If it is only a block(s) look up */
@@ -811,8 +814,15 @@ found:
 		 * ext4_ext_map_blocks()
 		 */
 		if (!(flags & EXT4_GET_BLOCKS_CONVERT_UNWRITTEN))
-			return retval;
+			goto out_handle;
 
+	if (!handle) {
+		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS,
+				ext4_chunk_trans_blocks(inode, orig_mlen));
+		if (IS_ERR(handle))
+			return PTR_ERR(handle);
+		internal_handle = true;
+	}
 
 	ext4_fc_track_inode(handle, inode);
 	/*
@@ -841,12 +851,14 @@ found:
 	if (retval < 0)
 		ext_debug(inode, "failed with err %d\n", retval);
 	if (retval <= 0)
-		return retval;
+		goto out_handle;
 
 	if (map->m_flags & EXT4_MAP_MAPPED) {
 		ret = check_block_validity(inode, map);
-		if (ret != 0)
-			return ret;
+		if (ret != 0) {
+			retval = ret;
+			goto out_handle;
+		}
 
 		/*
 		 * Inodes with freshly allocated blocks where contents will be
@@ -867,12 +879,18 @@ found:
 			else
 				ret = ext4_jbd2_inode_add_write(handle, inode,
 						start_byte, length);
-			if (ret)
-				return ret;
+			if (ret) {
+				retval = ret;
+				goto out_handle;
+			}
 		}
 	}
 	ext4_fc_track_range(handle, inode, map->m_lblk, map->m_lblk +
 			    map->m_len - 1);
+
+out_handle:
+	if (internal_handle)
+		ext4_journal_stop(handle);
 	return retval;
 }
 
