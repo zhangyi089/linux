@@ -703,6 +703,7 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
 	struct extent_status es;
 	int retval;
 	int ret = 0;
+	bool hold_data_sem = false;
 	unsigned int orig_mlen = map->m_len;
 #ifdef ES_AGGRESSIVE_TEST
 	struct ext4_map_blocks orig_map;
@@ -734,6 +735,7 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
 	else
 		ext4_check_map_extents_env(inode);
 
+create_retry:
 	/* Lookup extent status tree firstly */
 	if (ext4_es_lookup_extent(inode, map->m_lblk, NULL, &es, &map->m_seq)) {
 		if (ext4_es_is_written(&es) || ext4_es_is_unwritten(&es)) {
@@ -761,8 +763,9 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
 		if (flags & EXT4_GET_BLOCKS_CACHED_NOWAIT)
 			return retval;
 #ifdef ES_AGGRESSIVE_TEST
-		ext4_map_blocks_es_recheck(handle, inode, map,
-					   &orig_map, flags);
+		if (!hold_data_sem)
+			ext4_map_blocks_es_recheck(handle, inode, map,
+						   &orig_map, flags);
 #endif
 		if (!(flags & EXT4_GET_BLOCKS_QUERY_LAST_IN_LEAF) ||
 				orig_mlen == map->m_len)
@@ -781,15 +784,19 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
 	 * Try to see if we can get the block without requesting a new
 	 * file system block.
 	 */
-	down_read(&EXT4_I(inode)->i_data_sem);
+	if (!hold_data_sem)
+		down_read(&EXT4_I(inode)->i_data_sem);
 	retval = ext4_map_query_blocks(handle, inode, map, flags);
-	up_read((&EXT4_I(inode)->i_data_sem));
+	if (!hold_data_sem)
+		up_read((&EXT4_I(inode)->i_data_sem));
+	if (retval < 0)
+		goto out;
 
 found:
 	if (retval > 0 && map->m_flags & EXT4_MAP_MAPPED) {
 		ret = check_block_validity(inode, map);
 		if (ret != 0)
-			return ret;
+			goto out;
 	}
 
 	/* If it is only a block(s) look up */
@@ -809,7 +816,7 @@ found:
 		 * ext4_ext_map_blocks()
 		 */
 		if (!(flags & EXT4_GET_BLOCKS_CONVERT_UNWRITTEN))
-			return retval;
+			goto out;
 
 
 	ext4_fc_track_inode(handle, inode);
@@ -819,9 +826,27 @@ found:
 	 * the write lock of i_data_sem, and call get_block()
 	 * with create == 1 flag.
 	 */
-	down_write(&EXT4_I(inode)->i_data_sem);
+	if (!hold_data_sem)
+		down_write(&EXT4_I(inode)->i_data_sem);
+
+	/*
+	 * Check the validity of the mapping found via the extent status
+	 * tree or the disk query. A racing truncate may have changed the
+	 * extent, since writeback may not hold i_rwsem or the folio locks
+	 * covering the full extent(e.g., the iomap writeback path may
+	 * allocate an extent that extends beyond the length of the locked
+	 * folio in advance).
+	 */
+	if (map->m_seq != READ_ONCE(EXT4_I(inode)->i_es_seq)) {
+		/* Hold i_data_sem to avoid the retry amplification. */
+		hold_data_sem = true;
+		map->m_flags = 0;
+		map->m_len = orig_mlen;
+		goto create_retry;
+	}
 	retval = ext4_map_create_blocks(handle, inode, map, flags);
 	up_write((&EXT4_I(inode)->i_data_sem));
+	hold_data_sem = false;
 
 	if (retval < 0)
 		ext_debug(inode, "failed with err %d\n", retval);
@@ -858,7 +883,11 @@ found:
 	}
 	ext4_fc_track_range(handle, inode, map->m_lblk, map->m_lblk +
 			    map->m_len - 1);
-	return retval;
+out:
+	if (hold_data_sem)
+		up_write((&EXT4_I(inode)->i_data_sem));
+
+	return ret ? ret : retval;
 }
 
 /*
