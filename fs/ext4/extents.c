@@ -5167,11 +5167,15 @@ int ext4_convert_unwritten_extents(handle_t *handle, struct inode *inode,
 				      EXT4_GET_BLOCKS_IO_CONVERT_EXT |
 				      EXT4_EX_NOCACHE);
 		if (ret <= 0) {
+			/*
+			 * If the ret is zero, an unexpected hole may cause
+			 * conversion to fail.  To avoid data loss during I/O
+			 * end conversion, skip the hole and continue
+			 * converting subsequent blocks.
+			 */
 			ext4_warning(inode->i_sb,
 				     "inode #%llu: block %u: len %u: ext4_map_blocks returned %d",
 				     inode->i_ino, map.m_lblk, map.m_len, ret);
-			if (unlikely(ret == 0))
-				ret = -EINVAL;
 		} else {
 			conv_blocks += map.m_len;
 		}
