@@ -4068,7 +4068,9 @@ static struct buffer_head *ext4_load_tail_bh(struct inode *inode, loff_t from)
 	}
 	if (!buffer_mapped(bh)) {
 		BUFFER_TRACE(bh, "unmapped");
-		ext4_get_block(inode, iblock, bh, 0);
+		err = ext4_get_block(inode, iblock, bh, 0);
+		if (err < 0)
+			goto unlock;
 		/*
 		 * It's a hole or a clean unwritten block - nothing to do.
 		 * Note that a lookup-only get_block (without
