@@ -4824,6 +4824,32 @@ static int ext4_block_zero_range(struct inode *inode,
 }
 
 /*
+ * Submit and wait for the pending zeroed EOF block range to complete
+ * if the given range [@offset, @end) fully covers it.  Must be called
+ * outside the context of an active journal handle and hold the i_rwsem.
+ */
+int ext4_iomap_sync_zeroed_eof(struct inode *inode, loff_t offset, loff_t end)
+{
+	loff_t pstart, plen;
+	int ret;
+
+	if (!ext4_inode_buffered_iomap(inode))
+		return 0;
+
+	plen = ext4_iomap_get_disksize_pending_range(inode, &pstart);
+	if (!plen || offset > pstart || end < pstart + plen)
+		return 0;
+
+	ret = filemap_fdatawrite_range(inode->i_mapping, pstart,
+				       pstart + plen - 1);
+	if (ret)
+		return ret;
+
+	ext4_iomap_wait_disksize_pending(inode);
+	return 0;
+}
+
+/*
  * Zero out a mapping from file offset 'from' up to the end of the block
  * which corresponds to 'from' or to the given 'end' inside this block.
  * This required during truncate up and performing append writes. We need
@@ -4987,6 +5013,14 @@ int ext4_update_disksize_before_punch(struct inode *inode, loff_t offset,
 	WARN_ON(!inode_is_locked(inode));
 	if (offset > size)
 		return 0;
+
+	/*
+	 * We are going to punch the pending zeroed EOF block, persist
+	 * it to ensure i_disksize can be safely updated thereafter.
+	 */
+	ret = ext4_iomap_sync_zeroed_eof(inode, offset, offset + len);
+	if (ret)
+		return ret;
 
 	if (offset + len < size)
 		size = offset + len;
