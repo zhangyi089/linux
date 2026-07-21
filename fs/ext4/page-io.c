@@ -31,6 +31,8 @@
 #include "xattr.h"
 #include "acl.h"
 
+#include <trace/events/ext4.h>
+
 static struct kmem_cache *io_end_cachep;
 static struct kmem_cache *io_end_vec_cachep;
 
@@ -574,6 +576,7 @@ static void ext4_iomap_wb_disksize_pending_wait(struct inode *inode,
 	if (!plen || pos < pstart + plen)
 		return;
 
+	trace_ext4_iomap_wb_disksize_pending_wait(inode, pos, size);
 	ext4_iomap_wait_disksize_pending(inode);
 }
 
@@ -617,8 +620,11 @@ static int ext4_iomap_wb_update_disksize(handle_t *handle, struct inode *inode,
 	 * after the data has been persisted.
 	 */
 	new_disksize = is_disksize_grow ? i_size : min(end, i_size);
-	if (new_disksize > ei->i_disksize)
+	if (new_disksize > ei->i_disksize) {
+		trace_ext4_iomap_wb_update_disksize(inode, end, i_size,
+				ei->i_disksize, new_disksize, is_disksize_grow);
 		WRITE_ONCE(ei->i_disksize, new_disksize);
+	}
 	up_write(&ei->i_data_sem);
 	ret = ext4_mark_inode_dirty(handle, inode);
 	if (ret)
@@ -729,8 +735,11 @@ void ext4_iomap_end_bio(struct bio *bio)
 	 * state set in ext4_block_zero_eof() and wake up all waiters
 	 * that will update the inode i_disksize.
 	 */
-	if (io_mode == EXT4_IOMAP_IOEND_DISKSIZE_GROW_IO)
+	if (io_mode == EXT4_IOMAP_IOEND_DISKSIZE_GROW_IO) {
+		trace_ext4_iomap_wb_disksize_pending_complete(ioend->io_inode,
+				ioend->io_offset, ioend->io_size);
 		ext4_iomap_clear_disksize_pending(ioend->io_inode);
+	}
 
 	spin_lock_irqsave(&ei->i_completed_io_lock, flags);
 	if (list_empty(&ei->i_rsv_conversion_list))
