@@ -5166,19 +5166,21 @@ int ext4_convert_unwritten_extents(handle_t *handle, struct inode *inode,
 		ret = ext4_map_blocks(handle, inode, &map,
 				      EXT4_GET_BLOCKS_IO_CONVERT_EXT |
 				      EXT4_EX_NOCACHE);
-		if (ret <= 0) {
-			/*
-			 * If the ret is zero, an unexpected hole may cause
-			 * conversion to fail.  To avoid data loss during I/O
-			 * end conversion, skip the hole and continue
-			 * converting subsequent blocks.
-			 */
+		/*
+		 * A return value of zero means an unexpected hole was found.
+		 * This can happen when writeback races with a concurrent
+		 * punch hole in the iomap path. Because iomap may not create
+		 * ifs for folios larger than block size, the dirty bit can
+		 * be set again after punching. If writeback happens between
+		 * partial folio invalidation and extent removal, a hole is
+		 * observed at I/O completion.
+		 */
+		if (ret < 0)
 			ext4_warning(inode->i_sb,
 				     "inode #%llu: block %u: len %u: ext4_map_blocks returned %d",
 				     inode->i_ino, map.m_lblk, map.m_len, ret);
-		} else {
+		else if (ret > 0)
 			conv_blocks += map.m_len;
-		}
 
 		ret2 = ext4_mark_inode_dirty(handle, inode);
 		if (credits) {
