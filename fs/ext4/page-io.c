@@ -741,10 +741,8 @@ void ext4_iomap_end_bio(struct bio *bio)
 	if (io_mode == EXT4_IOMAP_IOEND_DISKSIZE_GROW_IO)
 		ext4_iomap_clear_disksize_pending(ioend->io_inode);
 
-	spin_lock_irqsave(&ei->i_completed_io_lock, flags);
-	if (list_empty(&ei->i_rsv_conversion_list))
-		queue_work(EXT4_SB(ioend->io_inode->i_sb)->rsv_conversion_wq,
-			   &ei->i_rsv_conversion_work);
-	list_add_tail(&ioend->io_list, &ei->i_rsv_conversion_list);
-	spin_unlock_irqrestore(&ei->i_completed_io_lock, flags);
+	if (bio_complete_in_task(bio))
+		return;
+
+	ext4_iomap_finish_ioend(ioend);
 }

@@ -4434,7 +4434,7 @@ static int ext4_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 	 * in task framework.
 	 */
 	if (ioend->io_bio.bi_end_io)
-		bio_clear_flag(&ioend->io_bio, BIO_COMPLETE_IN_TASK);
+		bio_set_flag(&ioend->io_bio, BIO_COMPLETE_IN_TASK);
 
 	return iomap_ioend_writeback_submit(wpc, error);
 }
